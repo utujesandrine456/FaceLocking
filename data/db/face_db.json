@@ -1,12 +1,17 @@
 {
-  "updated_at": "2026-09-23 09:58:35",
+  "updated_at": "2026-10-22 13:09:04",
   "embedding_dim": 512,
   "names": [
     "Blessed",
+    "Sandrine",
     "Utuje"
   ],
-  "samples_existing_used": 18,
-  "samples_new_used": 34,
-  "samples_total_used": 52,
-  "note": "Renamed Winner -> Utuje. Embeddings are L2-normalized vectors. Matching uses cosine similarity."
+  "sample_counts": {
+    "Blessed": 52,
+    "Sandrine": 6,
+    "Utuje": 15
+  },
+  "samples_total_used": 73,
+  "model_path": "models\\embedder_arcface.onnx",
+  "note": "L2-normalized ArcFace mean embeddings. Metric: cosine distance/similarity."
 }

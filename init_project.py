@@ -16,7 +16,8 @@ structure = {
         "enroll.py",
         "recognize.py",
         "evaluate.py",
-        "haar_5pt.py",
+        "yunet_5pt.py",
+        "haar_5pt.py",  # shim -> yunet_5pt
     ],
     "book": [],
 }

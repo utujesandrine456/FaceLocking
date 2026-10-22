@@ -1,83 +1,49 @@
 # src/landmarks.py
 """
 Minimal pipeline:
-camera -> Haar face box -> MediaPipe FaceMesh (full-frame) -> extract 5 keypoints -> draw
+camera -> YuNet face box + 5 keypoints -> draw
 
 Run: python -m src.landmarks
 Keys: q : quit
 """
-import cv2
-import numpy as np
-import mediapipe as mp
+from __future__ import annotations
 
-# 5-point indices (FaceMesh)
-IDX_LEFT_EYE = 33
-IDX_RIGHT_EYE = 263
-IDX_NOSE_TIP = 1
-IDX_MOUTH_LEFT = 61
-IDX_MOUTH_RIGHT = 291
+import cv2
+
+from .yunet_5pt import YuNet5ptDetector
 
 
 def main():
-    # Haar
-    cascade_path = "models/haarcascade_frontalface_default.xml"
-    face = cv2.CascadeClassifier(cascade_path)
-    if face.empty():
-        raise RuntimeError(f"Failed to load cascade: {cascade_path}")
-
-    # FaceMesh
-    fm = mp.solutions.face_mesh.FaceMesh(
-        static_image_mode=False,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-
+    det = YuNet5ptDetector(smooth_alpha=0.50, debug=False)
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap.isOpened():
         raise RuntimeError("Camera not opened. Try camera index 0/1/2.")
 
-    print("Haar + FaceMesh 5pt (minimal). Press 'q' to quit.")
+    print("YuNet 5pt landmarks. Press 'q' to quit.")
     while True:
         ok, frame = cap.read()
         if not ok:
             break
 
-        H, W = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-
-        # draw ALL haar faces (no ranking)
-        for (x, y, w, h) in faces:
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-        # FaceMesh on full frame (simple)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = fm.process(rgb)
-
-        if res.multi_face_landmarks:
-            lm = res.multi_face_landmarks[0].landmark
-            idxs = [IDX_LEFT_EYE, IDX_RIGHT_EYE, IDX_NOSE_TIP, IDX_MOUTH_LEFT, IDX_MOUTH_RIGHT]
-            pts = []
-            for i in idxs:
-                p = lm[i]
-                pts.append([p.x * W, p.y * H])
-            kps = np.array(pts, dtype=np.float32)  # (5,2)
-
-            # enforce left/right ordering
-            if kps[0, 0] > kps[1, 0]:
-                kps[[0, 1]] = kps[[1, 0]]
-            if kps[3, 0] > kps[4, 0]:
-                kps[[3, 4]] = kps[[4, 3]]
-
-            # draw 5 points
-            for (px, py) in kps.astype(int):
+        faces = det.detect(frame, max_faces=5)
+        for f in faces:
+            cv2.rectangle(frame, (f.x1, f.y1), (f.x2, f.y2), (0, 255, 0), 2)
+            for (px, py) in f.kps.astype(int):
                 cv2.circle(frame, (int(px), int(py)), 4, (0, 255, 0), -1)
+            cv2.putText(
+                frame,
+                "5pt",
+                (f.x1, max(0, f.y1 - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0),
+                2,
+            )
 
-            cv2.putText(frame, "5pt", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+        if not faces:
+            cv2.putText(frame, "no face", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
 
-        cv2.imshow("5pt Landmarks", frame)
+        cv2.imshow("5pt Landmarks (YuNet)", frame)
         if (cv2.waitKey(1) & 0xFF) == ord("q"):
             break
 

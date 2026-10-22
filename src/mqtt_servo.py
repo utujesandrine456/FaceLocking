@@ -1,10 +1,11 @@
 # src/mqtt_servo.py
 """
-Publish pan servo angles to the ESP8266 over MQTT.
+Publish face recognition status to the ESP8266 tachometer over MQTT.
 
 Broker/topic must match firmware:
-  broker.benax.rw:1883
-  face-recognition/servo/pan
+  10.12.73.141:1883
+  face/status  ("1" = recognised, "0" = not recognised)
+  tacho/state  (LWT topic)
 """
 from __future__ import annotations
 
@@ -18,9 +19,9 @@ except Exception as e:  # pragma: no cover
     _MQTT_IMPORT_ERROR = e
 
 
-DEFAULT_BROKER = "broker.benax.rw"
+DEFAULT_BROKER = "10.12.73.141"
 DEFAULT_PORT = 1883
-DEFAULT_TOPIC = "face-recognition/servo/pan"
+DEFAULT_TOPIC = "face/status"
 
 MIN_ANGLE = 20
 MAX_ANGLE = 160

@@ -1,7 +1,7 @@
 # src/recognize.py
 """
 Multi-face recognition (CPU-friendly):
-Haar (multi-face) -> FaceMesh 5pt (per-face ROI) -> align_face_5pt (112x112)
+YuNet (box + 5pt) -> align_face_5pt (112x112)
 -> ArcFace ONNX embedding -> cosine distance to DB -> label each face.
 
 Run: python -m src.recognize
@@ -27,16 +27,131 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-try:
-    import mediapipe as mp
-except Exception as e:
-    mp = None
-    _MP_IMPORT_ERROR = e
-
-from .haar_5pt import align_face_5pt
+from .yunet_5pt import YuNet5ptDetector, align_face_5pt
 from .embed import ArcFaceEmbedderONNX
 from .mqtt_servo import ServoPanPublisher, PanController
 from .expression import ExpressionState, FaceSideState, analyze_optional, face_horizontal_side
+
+try:
+    import paho.mqtt.client as _paho_mqtt
+except Exception:
+    _paho_mqtt = None
+
+
+class TachoPublisher:
+    """Publishes angle (0-180) to ESP8266 stepper when a known face is locked.
+
+    Simple rule:
+      - Known face LOCKED   -> publish angle matching face X position.
+                               Needle follows in real time.
+      - Face NOT seen / unknown -> publish NOTHING.
+                                   Needle stays frozen at its last position.
+
+    MQTT topic : face/status
+    Payload    : ASCII integer  e.g. "0" (left) | "90" (centre) | "180" (right)
+    """
+
+    TOPIC_STATUS = "face/status"
+    TOPIC_TACHO  = "tacho/state"
+    ANGLE_MIN    = 0
+    ANGLE_MAX    = 180
+
+    def __init__(self, broker: str = "10.12.73.141", port: int = 1883):
+        if _paho_mqtt is None:
+            raise RuntimeError("paho-mqtt not installed. Run: pip install paho-mqtt")
+        self.broker = broker
+        self.port   = port
+        self._connected  = False
+        self._last_angle: Optional[int] = None
+
+        if hasattr(_paho_mqtt, "CallbackAPIVersion"):
+            self._client = _paho_mqtt.Client(
+                callback_api_version=_paho_mqtt.CallbackAPIVersion.VERSION1,
+                client_id="pc-face-tacho",
+            )
+        else:
+            self._client = _paho_mqtt.Client(client_id="pc-face-tacho")
+
+        self._client.on_connect    = self._on_connect
+        self._client.on_disconnect = self._on_disconnect
+
+    def _on_connect(self, client, userdata, flags, rc):
+        self._connected = rc == 0
+        if self._connected:
+            print(f"[tacho] MQTT connected {self.broker}:{self.port}")
+            self._client.publish(self.TOPIC_TACHO, "online", retain=True)
+        else:
+            print(f"[tacho] MQTT connect failed rc={rc}")
+
+    def _on_disconnect(self, client, userdata, rc):
+        self._connected = False
+        print(f"[tacho] MQTT disconnected rc={rc}")
+
+    def connect(self) -> None:
+        import time as _time
+        self._client.connect(self.broker, self.port, keepalive=30)
+        self._client.loop_start()
+        deadline = _time.time() + 3.0
+        while _time.time() < deadline and not self._connected:
+            _time.sleep(0.05)
+        if not self._connected:
+            print("[tacho] warning: not connected yet; retrying in background")
+
+    def _send_angle(self, angle: int) -> None:
+        """Raw publish — only sends if angle actually changed."""
+        angle = int(max(self.ANGLE_MIN, min(self.ANGLE_MAX, angle)))
+        if angle == self._last_angle:
+            return
+        self._last_angle = angle
+        info = self._client.publish(self.TOPIC_STATUS, str(angle), qos=1)
+        ok   = (info.rc == 0)
+        print(f"[tacho] face/status -> '{angle}' {'ok' if ok else 'FAIL'}")
+
+    def update(
+        self,
+        face_cx: Optional[float],
+        face_cy: Optional[float],
+        frame_width: int,
+        frame_height: int,
+        is_locked: bool,
+        axis: str = "vertical",
+    ) -> None:
+        """
+        Call every frame.
+
+        face_cx      : horizontal centre of tracked face in pixels (None = no face)
+        face_cy      : vertical centre of tracked face in pixels (None = no face)
+        frame_width  : full frame width in pixels
+        frame_height : full frame height in pixels
+        is_locked    : True ONLY when a known (enrolled) face is locked
+        axis         : 'vertical' (head UP -> needle LEFT) or 'horizontal'
+        """
+        if not is_locked:
+            # Face not seen or identity unknown -> do nothing.
+            # Needle stays frozen at its last position.
+            return
+
+        if axis == "vertical":
+            if face_cy is None:
+                return
+            # y=0 is top (head up -> ratio ~ 0 -> needle 0 deg left)
+            # y=h is bottom (head down -> ratio ~ 1 -> needle 180 deg right)
+            ratio = float(face_cy) / float(max(frame_height, 1))
+        else:
+            if face_cx is None:
+                return
+            ratio = float(face_cx) / float(max(frame_width, 1))
+
+        ratio = max(0.0, min(1.0, ratio))
+        angle = int(round(self.ANGLE_MIN + ratio * (self.ANGLE_MAX - self.ANGLE_MIN)))
+        self._send_angle(angle)
+
+    def close(self) -> None:
+        try:
+            self._client.loop_stop()
+            self._client.disconnect()
+        except Exception:
+            pass
 
 
 @dataclass
@@ -68,53 +183,6 @@ def cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
     return 1.0 - cosine_similarity(a, b)
 
 
-def _clip_xyxy(x1: float, y1: float, x2: float, y2: float, W: int, H: int) -> Tuple[int, int, int, int]:
-    x1 = int(max(0, min(W - 1, round(x1))))
-    y1 = int(max(0, min(H - 1, round(y1))))
-    x2 = int(max(0, min(W - 1, round(x2))))
-    y2 = int(max(0, min(H - 1, round(y2))))
-    if x2 < x1:
-        x1, x2 = x2, x1
-    if y2 < y1:
-        y1, y2 = y2, y1
-    return x1, y1, x2, y2
-
-
-def _bbox_from_5pt(
-    kps: np.ndarray, pad_x: float = 0.55, pad_y_top: float = 0.85, pad_y_bot: float = 1.15,
-) -> np.ndarray:
-    k = kps.astype(np.float32)
-    x_min = float(np.min(k[:, 0]))
-    x_max = float(np.max(k[:, 0]))
-    y_min = float(np.min(k[:, 1]))
-    y_max = float(np.max(k[:, 1]))
-    w = max(1.0, x_max - x_min)
-    h = max(1.0, y_max - y_min)
-    x1 = x_min - pad_x * w
-    x2 = x_max + pad_x * w
-    y1 = y_min - pad_y_top * h
-    y2 = y_max + pad_y_bot * h
-    return np.array([x1, y1, x2, y2], dtype=np.float32)
-
-
-def _ema(prev: Optional[np.ndarray], cur: np.ndarray, alpha: float) -> np.ndarray:
-    if prev is None:
-        return cur.astype(np.float32)
-    return (alpha * prev + (1.0 - alpha) * cur).astype(np.float32)
-
-
-def _kps_span_ok(kps: np.ndarray, min_eye_dist: float) -> bool:
-    k = kps.astype(np.float32)
-    le, re, no, lm, rm = k
-    eye_dist = float(np.linalg.norm(re - le))
-    # Softer eye-span check so closed-eye frames are not rejected as often.
-    if eye_dist < float(min_eye_dist) * 0.75:
-        return False
-    if not (lm[1] > no[1] and rm[1] > no[1]):
-        return False
-    return True
-
-
 def load_db_npz(db_path: Path) -> Dict[str, np.ndarray]:
     if not db_path.exists():
         return {}
@@ -125,125 +193,27 @@ def load_db_npz(db_path: Path) -> Dict[str, np.ndarray]:
     return out
 
 
-class HaarFaceMesh5pt:
-    def __init__(
-        self,
-        haar_xml: Optional[str] = None,
-        min_size: Tuple[int, int] = (60, 60),
-        smooth_alpha: float = 0.75,
-        debug: bool = False,
-    ):
-        self.debug = bool(debug)
-        self.min_size = tuple(map(int, min_size))
-        self.smooth_alpha = float(smooth_alpha)
-        self._prev_kps: Optional[np.ndarray] = None
-        self._prev_box: Optional[np.ndarray] = None
-
-        if haar_xml is None:
-            haar_xml = "models/haarcascade_frontalface_default.xml"
-        self.face_cascade = cv2.CascadeClassifier(haar_xml)
-        if self.face_cascade.empty():
-            raise RuntimeError(f"Failed to load Haar cascade: {haar_xml}")
-
-        if mp is None:
-            raise RuntimeError(
-                f"mediapipe import failed: {_MP_IMPORT_ERROR}\n"
-                f"Install: pip install mediapipe==0.10.21"
-            )
-        self.mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=False,
-            min_detection_confidence=0.4,
-            min_tracking_confidence=0.4,
-        )
-
-        self.IDX_LEFT_EYE = 33
-        self.IDX_RIGHT_EYE = 263
-        self.IDX_NOSE_TIP = 1
-        self.IDX_MOUTH_LEFT = 61
-        self.IDX_MOUTH_RIGHT = 291
-
-    def _haar_faces(self, gray: np.ndarray) -> np.ndarray:
-        faces = self.face_cascade.detectMultiScale(
-            gray, scaleFactor=1.1, minNeighbors=4, flags=cv2.CASCADE_SCALE_IMAGE, minSize=self.min_size,
-        )
-        if faces is None or len(faces) == 0:
-            return np.zeros((0, 4), dtype=np.int32)
-        return faces.astype(np.int32)
-
-    def _facemesh_5pt_full(self, frame_bgr: np.ndarray):
-        H, W = frame_bgr.shape[:2]
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        res = self.mesh.process(rgb)
-        if not res.multi_face_landmarks:
-            return None, None
-
-        lm = res.multi_face_landmarks[0].landmark
-        idxs = [self.IDX_LEFT_EYE, self.IDX_RIGHT_EYE, self.IDX_NOSE_TIP, self.IDX_MOUTH_LEFT, self.IDX_MOUTH_RIGHT]
-        pts = []
-        for i in idxs:
-            p = lm[i]
-            pts.append([p.x * W, p.y * H])
-        kps = np.array(pts, dtype=np.float32)
-
-        if kps[0, 0] > kps[1, 0]:
-            kps[[0, 1]] = kps[[1, 0]]
-        if kps[3, 0] > kps[4, 0]:
-            kps[[3, 4]] = kps[[4, 3]]
-
-        expr = analyze_optional(lm, W, H)
-        return kps, expr
+class YuNetFaceDetector(YuNet5ptDetector):
+    """YuNet detector that returns FaceDet (optional expression field)."""
 
     def detect(self, frame_bgr: np.ndarray, max_faces: int = 5) -> List[FaceDet]:
-        H, W = frame_bgr.shape[:2]
-        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-        faces = self._haar_faces(gray)
-        if faces.shape[0] == 0:
-            self._prev_kps = None
-            self._prev_box = None
-            return []
-
-        areas = faces[:, 2] * faces[:, 3]
-        order = np.argsort(areas)[::-1]
-        faces = faces[order][:max_faces]
-
-        # Full-frame FaceMesh is much more stable than per-ROI mesh on USB cams.
-        kps, expr = self._facemesh_5pt_full(frame_bgr)
-        if kps is None:
-            return []
-
-        x, y, w, h = faces[0].tolist()
-        margin = 0.45
-        x1m, y1m = x - margin * w, y - margin * h
-        x2m, y2m = x + (1.0 + margin) * w, y + (1.0 + margin) * h
-        inside = (
-            (kps[:, 0] >= x1m) & (kps[:, 0] <= x2m) &
-            (kps[:, 1] >= y1m) & (kps[:, 1] <= y2m)
-        )
-        if float(inside.mean()) < 0.50:
-            if self.debug:
-                print("[recognize] FaceMesh not consistent with Haar -> skip")
-            return []
-
-        if not _kps_span_ok(kps, min_eye_dist=max(8.0, 0.12 * float(w))):
-            if self.debug:
-                print("[recognize] 5pt geometry failed -> skip")
-            return []
-
-        bb = _bbox_from_5pt(kps, pad_x=0.55, pad_y_top=0.85, pad_y_bot=1.15)
-        kps_s = _ema(self._prev_kps, kps, self.smooth_alpha)
-        bb_s = _ema(self._prev_box, bb, self.smooth_alpha)
-        self._prev_kps = kps_s.copy()
-        self._prev_box = bb_s.copy()
-
-        x1, y1, x2, y2 = _clip_xyxy(bb_s[0], bb_s[1], bb_s[2], bb_s[3], W, H)
+        boxes = super().detect(frame_bgr, max_faces=max_faces)
         return [
             FaceDet(
-                x1=x1, y1=y1, x2=x2, y2=y2, score=1.0,
-                kps=kps_s.astype(np.float32), expression=expr,
+                x1=f.x1,
+                y1=f.y1,
+                x2=f.x2,
+                y2=f.y2,
+                score=f.score,
+                kps=f.kps,
+                expression=None,
             )
+            for f in boxes
         ]
+
+
+# Backward-compatible alias
+HaarFaceMesh5pt = YuNetFaceDetector
 
 
 class FaceDBMatcher:
@@ -292,11 +262,22 @@ def main():
         default=1,
         help="OpenCV camera index (default 1 = usually USB/embedded; 0 = laptop webcam)",
     )
+    parser.add_argument(
+        "--no-flip",
+        action="store_true",
+        help="Disable horizontal mirror flip (mirror is enabled by default)",
+    )
+    parser.add_argument(
+        "--axis",
+        choices=["vertical", "horizontal"],
+        default="vertical",
+        help="Tracking axis: 'vertical' (head UP -> needle LEFT) or 'horizontal' (default: vertical)",
+    )
     args = parser.parse_args()
 
     db_path = Path("data/db/face_db.npz")
 
-    det = HaarFaceMesh5pt(min_size=(60, 60), smooth_alpha=0.75, debug=False)
+    det = YuNetFaceDetector(smooth_alpha=0.65, debug=False)
     embedder = ArcFaceEmbedderONNX(model_path="models/embedder_arcface.onnx", input_size=(112, 112), debug=False)
 
     db = load_db_npz(db_path)
@@ -313,9 +294,11 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    mqtt_enabled = True
-    search_enabled = True
-    invert_pan = False
+    # Servo pan publisher is DISABLED — hardware is a stepper motor, not a servo.
+    # All needle control goes through TachoPublisher (face/status topic).
+    mqtt_enabled   = False   # keeps ServoPanPublisher silent
+    search_enabled = False   # needle never sweeps — it only follows a locked face
+    invert_pan     = False
     pan_angle: Optional[int] = 90
     pan_mode = "idle"
     pan = PanController(
@@ -334,19 +317,31 @@ def main():
     sticky_hold_s = 0.7
     last_expr_log: Optional[str] = None
     last_side_log: Optional[str] = None
+
+    # --- Tachometer publisher (sends "1"/"0" to face/status for ESP8266 stepper) ---
+    tacho_pub: Optional[TachoPublisher] = None
     try:
-        servo_pub = ServoPanPublisher(min_publish_interval_s=0.08, min_angle_delta=1)
-        servo_pub.connect()
-        servo_pub.publish_angle(90, force=True)
+        tacho_pub = TachoPublisher(broker="10.12.73.141", port=1883)
+        tacho_pub.connect()
+        print("[tacho] publisher ready — needle will track once your face is locked")
     except Exception as e:
-        mqtt_enabled = False
-        print(f"[recognize] MQTT disabled: {e}")
+        tacho_pub = None
+        print(f"[tacho] MQTT disabled: {e}")
+
+    # ServoPanPublisher intentionally not started (no servo in this setup).
+    servo_pub: Optional[ServoPanPublisher] = None
 
     print(
         f"Recognize cam={args.cam}. "
-        "q=quit, r=reload, +/- thr, d=debug, m=MQTT, i=invert, s=search"
+        "q=quit  r=reload  +/- threshold  d=debug  i=invert  f=flip-mirror  v=axis(V/H)"
     )
-    print("[pan] face -> LOCK. missing ~0.45s -> SEARCH sweep. Watch mode= on screen.")
+    print("[tacho] Needle at CENTER on ESP startup. Move into view to be identified, then move and needle follows.")
+
+    mirror = not args.no_flip
+    print(f"[recognize] mirror flip (horizontal): {'ON' if mirror else 'OFF'}")
+
+    track_axis = args.axis
+    print(f"[tacho] tracking axis: {track_axis.upper()} (head UP -> needle LEFT, head DOWN -> needle RIGHT)")
 
     t0 = time.time()
     frames = 0
@@ -357,6 +352,8 @@ def main():
         ok, frame = cap.read()
         if not ok:
             break
+        if mirror:
+            frame = cv2.flip(frame, 1)
 
         faces = det.detect(frame, max_faces=5)
         vis = frame.copy()
@@ -478,13 +475,25 @@ def main():
                 track_label = first_label
 
         face_cx: Optional[float] = None
+        face_cy: Optional[float] = None
         if track_face is not None:
             face_cx = 0.5 * (track_face.x1 + track_face.x2)
-            cv2.line(vis, (int(face_cx), 0), (int(face_cx), h), (255, 200, 0), 2)
-            cv2.line(vis, (w // 2, 0), (w // 2, h), (0, 255, 255), 1)
-            dz = int(0.04 * w)
-            cv2.line(vis, (w // 2 - dz, 0), (w // 2 - dz, h), (80, 80, 80), 1)
-            cv2.line(vis, (w // 2 + dz, 0), (w // 2 + dz, h), (80, 80, 80), 1)
+            face_cy = 0.5 * (track_face.y1 + track_face.y2)
+
+            if track_axis == "vertical":
+                # Horizontal guideline tracking vertical face movement
+                cv2.line(vis, (0, int(face_cy)), (w, int(face_cy)), (255, 200, 0), 2)
+                cv2.line(vis, (0, h // 2), (w, h // 2), (0, 255, 255), 1)
+                dz = int(0.04 * h)
+                cv2.line(vis, (0, h // 2 - dz), (w, h // 2 - dz), (80, 80, 80), 1)
+                cv2.line(vis, (0, h // 2 + dz), (w, h // 2 + dz), (80, 80, 80), 1)
+            else:
+                # Vertical guideline tracking horizontal face movement
+                cv2.line(vis, (int(face_cx), 0), (int(face_cx), h), (255, 200, 0), 2)
+                cv2.line(vis, (w // 2, 0), (w // 2, h), (0, 255, 255), 1)
+                dz = int(0.04 * w)
+                cv2.line(vis, (w // 2 - dz, 0), (w // 2 - dz, h), (80, 80, 80), 1)
+                cv2.line(vis, (w // 2 + dz, 0), (w // 2 + dz, h), (80, 80, 80), 1)
 
         pan.set_invert(invert_pan)
         prev_angle = int(pan_angle) if pan_angle is not None else None
@@ -501,6 +510,22 @@ def main():
                 servo_pub.publish_angle(int(pan_angle), force=True)
             elif pan_mode == "lock" and pan_angle != prev_angle:
                 servo_pub.publish_angle(int(pan_angle), force=False)
+
+        # --- Publish angle to tachometer ESP8266 (needle tracks face position) ---
+        if tacho_pub is not None:
+            # is_locked = True only when a KNOWN (non-Unknown) face is locked
+            is_locked = (
+                pan_mode == "lock"
+                and track_label not in ("none", "Unknown", None)
+            )
+            tacho_pub.update(
+                face_cx=face_cx,
+                face_cy=face_cy,
+                frame_width=w,
+                frame_height=h,
+                is_locked=is_locked,
+                axis=track_axis,
+            )
 
         # Big lock / search status
         if pan_mode == "lock":
@@ -523,6 +548,7 @@ def main():
         header += f" pan={pan_angle} mode={pan_mode}"
         header += f" mqtt={'ON' if mqtt_enabled else 'OFF'}"
         header += f" search={'ON' if search_enabled else 'OFF'}"
+        header += f" axis={track_axis.upper()}"
         if invert_pan:
             header += " inv"
         cv2.putText(vis, header, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
@@ -554,7 +580,15 @@ def main():
         elif key == ord("s"):
             search_enabled = not search_enabled
             print(f"[recognize] search-when-lost: {'ON' if search_enabled else 'OFF'}")
+        elif key == ord("f"):
+            mirror = not mirror
+            print(f"[recognize] mirror flip (horizontal): {'ON' if mirror else 'OFF'}")
+        elif key == ord("v"):
+            track_axis = "horizontal" if track_axis == "vertical" else "vertical"
+            print(f"[recognize] tracking axis toggled to: {track_axis.upper()}")
 
+    if tacho_pub is not None:
+        tacho_pub.close()
     if servo_pub is not None:
         servo_pub.close()
     cap.release()

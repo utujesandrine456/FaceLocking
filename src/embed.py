@@ -1,7 +1,7 @@
 # src/embed.py
 """
 Embedding stage (ArcFace ONNX):
-camera -> Haar detection -> FaceMesh 5pt -> align_face_5pt (112x112)
+camera -> YuNet (box + 5pt) -> align_face_5pt (112x112)
 -> ArcFace embedding -> vector visualization (education)
 
 Run: python -m src.embed
@@ -20,7 +20,7 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
-from .haar_5pt import Haar5ptDetector, align_face_5pt
+from .yunet_5pt import YuNet5ptDetector, align_face_5pt
 
 DEFAULT_EMBEDDER_MODEL = Path("models/embedder_arcface.onnx")
 FALLBACK_EMBEDDER_MODEL = Path("models/w600k_r50.onnx")
@@ -148,7 +148,7 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 def main():
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    det = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80, debug=False)
+    det = YuNet5ptDetector(smooth_alpha=0.65, debug=False)
     emb_model = ArcFaceEmbedderONNX(model_path="models/embedder_arcface.onnx", debug=False)
 
     prev_emb: Optional[np.ndarray] = None

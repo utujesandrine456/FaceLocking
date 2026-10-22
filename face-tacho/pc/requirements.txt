@@ -1,0 +1,6 @@
+paho-mqtt>=2.0.0
+opencv-python
+numpy
+onnxruntime
+mediapipe==0.10.21
+scipy

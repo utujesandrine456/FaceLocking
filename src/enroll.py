@@ -2,7 +2,7 @@
 """
 enroll.py
 Enrollment tool:
-camera -> Haar detection -> FaceMesh 5pt -> align_face_5pt (112x112) -> ArcFace embedding
+camera -> YuNet (box + 5pt) -> align_face_5pt (112x112) -> ArcFace embedding
 
 Stores template per identity (mean embedding, L2-normalized).
 
@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 import cv2
 import numpy as np
 
-from .haar_5pt import Haar5ptDetector, align_face_5pt
+from .yunet_5pt import YuNet5ptDetector, align_face_5pt
 from .embed import ArcFaceEmbedderONNX
 
 
@@ -151,7 +151,7 @@ def main():
         print("No name provided. Exiting.")
         return
 
-    det = Haar5ptDetector(min_size=(60, 60), smooth_alpha=0.80, debug=False)
+    det = YuNet5ptDetector(smooth_alpha=0.65, debug=False)
     emb = ArcFaceEmbedderONNX(model_path="models/embedder_arcface.onnx", input_size=(112, 112), debug=False)
 
     db = load_db(cfg)

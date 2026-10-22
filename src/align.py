@@ -1,8 +1,7 @@
 # src/align.py
 """
 Alignment demo:
-- Haar face detection (fast)
-- MediaPipe FaceMesh -> 5 keypoints (stable)
+- YuNet face detection + 5 keypoints
 - ArcFace-style 5pt alignment -> 112x112
 
 Run: python -m src.align
@@ -19,7 +18,7 @@ from typing import Tuple
 import cv2
 import numpy as np
 
-from .haar_5pt import Haar5ptDetector, align_face_5pt
+from .yunet_5pt import YuNet5ptDetector, align_face_5pt
 
 
 def _put_text(img, text: str, xy=(10, 30), scale=0.8, thickness=2):
@@ -38,7 +37,7 @@ def main(
     mirror: bool = True,
 ):
     cap = cv2.VideoCapture(cam_index, cv2.CAP_DSHOW)
-    det = Haar5ptDetector(min_size=(70, 70), smooth_alpha=0.80, debug=True)
+    det = YuNet5ptDetector(smooth_alpha=0.65, debug=True)
 
     out_w, out_h = int(out_size[0]), int(out_size[1])
     blank = np.zeros((out_h, out_w, 3), dtype=np.uint8)
@@ -72,7 +71,7 @@ def main(
             aligned, _M = align_face_5pt(frame, f.kps, out_size=out_size)
             if aligned is not None and aligned.size:
                 last_aligned = aligned
-            _put_text(vis, "OK (Haar + FaceMesh 5pt)", (10, 30), 0.75, 2)
+            _put_text(vis, "OK (YuNet 5pt)", (10, 30), 0.75, 2)
         else:
             _put_text(vis, "no face", (10, 30), 0.9, 2)
 
